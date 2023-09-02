@@ -148,7 +148,7 @@ impl<'d, T: Instance, Dma> Qspi<'d, T, Dma> {
         d3.set_as_af(d3.af_num(), AFType::OutputPushPull);
         d3.set_speed(crate::gpio::Speed::VeryHigh);
 
-        Self::new_inner(
+        let qspi = Self::new_inner(
             peri,
             Some(d0.map_into()),
             Some(d1.map_into()),
@@ -158,7 +158,13 @@ impl<'d, T: Instance, Dma> Qspi<'d, T, Dma> {
             Some(nss.map_into()),
             dma,
             config,
-        )
+        );
+
+        T::REGS.cr().modify(|w| {
+            w.set_fsel(true);
+        });
+
+        qspi
     }
 
     fn new_inner(
