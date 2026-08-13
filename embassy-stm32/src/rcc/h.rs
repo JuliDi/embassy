@@ -141,15 +141,27 @@ impl From<TimerPrescaler> for Timpre {
 }
 
 /// Power supply configuration
-/// See RM0433 Rev 4 7.4
+///
+/// See RM0399 Rev 4 Table 33 or RM0455 Rev 13 Table 34, "Supply configuration control". The
+/// two use different names for the same `PWR.CR3` fields: SDLEVEL/SDEXTHP/SDEN in RM0399,
+/// which is what the PAC follows, and SMPSLEVEL/SMPSEXTHP/SMPSEN in RM0455.
+///
+/// Only the combinations in that table are accepted, and which one is correct depends on how
+/// the board wires VDDLDO, VFBSMPS and VCAP, not on the chip. Choose deliberately: these bits
+/// are written once after POR and `CR3` is reset by POR only, so neither NRST nor a debug
+/// probe reset undoes a wrong choice, and two failure modes are unrecoverable in software.
+///
+/// - An invalid combination is discarded, but still locks `CR3`. `ACTVOSRDY` stays clear and
+///   `init` panics; power cycle to try another value.
+/// - A valid combination the board is not wired for can leave VCORE unsupplied. The core dies
+///   inside `init` and takes the debug port with it, needing BOOT0 or connect-under-reset.
+///
+/// Row 0 of that table, the power-up state, is deliberately absent here: SDLEVEL has to be
+/// non-zero whenever SDEN and LDOEN are both set, so it cannot be programmed. Use
+/// [`SupplyConfig::SMPSLDO`] for a board where the SMPS supplies the LDO.
 #[cfg(any(pwr_h7rm0399, pwr_h7rm0455, pwr_h7rm0468, pwr_h7rs))]
 #[derive(Clone, Copy, PartialEq)]
 pub enum SupplyConfig {
-    /// Default power supply configuration.
-    /// V CORE Power Domains are supplied from the LDO according to VOS.
-    /// SMPS step-down converter enabled at 1.2V, may be used to supply the LDO.
-    Default,
-
     /// Power supply configuration using the LDO.
     /// V CORE Power Domains are supplied from the LDO according to VOS.
     /// LDO power mode (Main, LP, Off) will follow system low-power modes.
@@ -235,6 +247,13 @@ pub struct Config {
     pub voltage_scale: VoltageScale,
     pub ls: super::LsConfig,
 
+    /// Power supply configuration.
+    ///
+    /// **Board-specific, and a wrong value cannot be recovered in software.** The default
+    /// suits boards that supply VDDLDO from VDD. Boards that supply it from the SMPS output,
+    /// including ST's `-Q` Nucleos, must select [`SupplyConfig::DirectSMPS`] or
+    /// [`SupplyConfig::SMPSLDO`], or VCORE is left unsupplied and the core dies inside
+    /// `init`. See [`SupplyConfig`] before changing this.
     #[cfg(any(pwr_h7rm0399, pwr_h7rm0455, pwr_h7rm0468, pwr_h7rs))]
     pub supply_config: SupplyConfig,
 
@@ -300,6 +319,9 @@ impl Config {
             ls: crate::rcc::LsConfig::new(),
 
             #[cfg(any(pwr_h7rm0399, pwr_h7rm0455, pwr_h7rm0468, pwr_h7rs))]
+            // No value is correct for every board, so this is only a valid starting point.
+            // Boards that supply VDDLDO from the SMPS output, such as ST's `-Q` Nucleos, must
+            // pick `DirectSMPS` or `SMPSLDO` or they lose VCORE entirely.
             supply_config: SupplyConfig::LDO,
 
             mux: super::mux::ClockMux::default(),
@@ -325,6 +347,11 @@ impl Default for Config {
     }
 }
 
+/// Polls to wait for `ACTVOSRDY` before giving up. Generous: the flag settles in microseconds
+/// when the supply configuration is valid, and never at all when it is not.
+#[cfg(any(stm32h7, stm32h7rs))]
+const ACTVOSRDY_TRIES: u32 = 1_000_000;
+
 pub(crate) unsafe fn init(config: Config) {
     #[cfg(any(stm32h7))]
     let pwr_reg = PWR.cr3();
@@ -347,15 +374,6 @@ pub(crate) unsafe fn init(config: Config) {
     {
         use pac::pwr::vals::Sdlevel;
         match config.supply_config {
-            SupplyConfig::Default => {
-                pwr_reg.modify(|w| {
-                    w.set_sdlevel(Sdlevel::Reset);
-                    w.set_sdexthp(false);
-                    w.set_sden(true);
-                    w.set_ldoen(true);
-                    w.set_bypass(false);
-                });
-            }
             SupplyConfig::LDO => {
                 pwr_reg.modify(|w| {
                     w.set_sden(false);
@@ -401,17 +419,47 @@ pub(crate) unsafe fn init(config: Config) {
                 });
             }
         }
+        // The write is silently dropped if the combination is invalid, or if an earlier boot
+        // already latched a different one. Read back so that neither looks like success.
+        let cr3 = pwr_reg.read();
+        let (sden, ldoen, bypass) = match config.supply_config {
+            SupplyConfig::LDO => (false, true, false),
+            SupplyConfig::DirectSMPS => (true, false, false),
+            SupplyConfig::SMPSLDO(_) | SupplyConfig::SMPSExternalLDO(_) => (true, true, false),
+            SupplyConfig::SMPSExternalLDOBypass(_) => (true, false, true),
+            SupplyConfig::SMPSDisabledLDOBypass => (false, false, true),
+        };
+        if cr3.sden() != sden || cr3.ldoen() != ldoen || cr3.bypass() != bypass {
+            warn!(
+                "PWR.CR3 supply config not applied: invalid combination, or latched by an earlier boot. Power-cycle to change it."
+            );
+        }
     }
 
-    // Validate the supply configuration. If you are stuck here, it is
-    // because the voltages on your board do not match those specified
-    // in the D3CR.VOS and CR3.SDLEVEL fields. By default after reset
-    // VOS = Scale 3, so check that the voltage on the VCAP pins =
-    // 1.0V.
-    #[cfg(any(stm32h7))]
-    while !PWR.csr1().read().actvosrdy() {}
-    #[cfg(any(stm32h7rs))]
-    while !PWR.sr1().read().actvosrdy() {}
+    // Until ACTVOSRDY is set the system stays in Run* mode, where RAM writes are forbidden
+    // and VOS must not be changed (RM0433/RM0455 6.4.1, RM0399 7.4.1, step 5). It never sets if the
+    // supply configuration was rejected, or if the voltages on the board do not match VOS
+    // and SDLEVEL, so bound the wait rather than hanging forever. There is no timebase this
+    // early in init, hence a loop count instead of a timeout.
+    #[cfg(any(stm32h7, stm32h7rs))]
+    {
+        let mut tries = 0u32;
+        loop {
+            #[cfg(stm32h7)]
+            let ready = PWR.csr1().read().actvosrdy();
+            #[cfg(stm32h7rs)]
+            let ready = PWR.sr1().read().actvosrdy();
+
+            if ready {
+                break;
+            }
+            tries += 1;
+            assert!(
+                tries < ACTVOSRDY_TRIES,
+                "PWR ACTVOSRDY never set: VCORE is not at the level selected by VOS. On parts with an SMPS this usually means rcc.supply_config does not match the board's power wiring."
+            );
+        }
+    }
 
     // Configure voltage scale.
     #[cfg(any(pwr_h5, pwr_h50))]
